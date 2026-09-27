@@ -1,7 +1,11 @@
-// Configuration
-const ROUND_DURATION_MS = 30000; // 30 seconds
+// Client is a pure renderer: it never computes a balance, a roll, or a
+// winner itself. Every bet goes to the server (server/server.js), which owns
+// the RNG, the balance, and the payout math. This file only sends requests
+// and displays whatever the server returns.
+
 const ANIMATION_DURATION_MS = 3000;
 const RESULT_DISPLAY_DURATION_MS = 3000;
+const ROUND_DURATION_MS = 30000; // 30 seconds
 
 const OPPONENTS = [
     { name: "Davy Jones", avatar: "assets/avatar_opponent.png" },
@@ -11,11 +15,12 @@ const OPPONENTS = [
 ];
 
 // State
-const game = new Game(); // Instantiate the Game logic
+let balance = 0;
+let payoutMultiplier = null;
 let gameState = 'BETTING'; // BETTING, ROLLING, RESULT
 let timeRemaining = ROUND_DURATION_MS;
-let timerInterval = null;
 let currentOpponent = OPPONENTS[0];
+let lastTime = Date.now();
 
 // DOM Elements
 const balanceDisplay = document.getElementById('player-balance');
@@ -28,6 +33,7 @@ const gameResultBadge = document.getElementById('game-result-badge');
 const timerBar = document.getElementById('timer-bar');
 const timerText = document.getElementById('timer-text');
 const betControls = document.querySelector('.betting-controls');
+const payoutInfoEl = document.getElementById('payout-info');
 
 const opponentAvatarEl = document.querySelector('.opponent .avatar-img');
 const opponentNameEl = document.querySelector('.opponent .player-name');
@@ -40,12 +46,17 @@ const opponentDiceEls = [
     document.getElementById('opp-die-1'),
     document.getElementById('opp-die-2')
 ];
-// Fallback if IDs missing in HTML (safeguard)
-const actualOpponentDiceEls = [
-    opponentDiceEls[0] || document.querySelector('#opponent-dice-container .die:nth-child(1)'),
-    opponentDiceEls[1] || document.querySelector('#opponent-dice-container .die:nth-child(2)')
-];
 
+async function api(path, options) {
+    const res = await fetch(path, {
+        method: options && options.method || 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        body: options && options.body ? JSON.stringify(options.body) : undefined,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Request failed.');
+    return data;
+}
 
 // Chip Buttons
 document.querySelectorAll('.chip-btn').forEach(btn => {
@@ -54,14 +65,14 @@ document.querySelectorAll('.chip-btn').forEach(btn => {
 
         const val = btn.dataset.value;
         if (val === 'max') {
-            betInput.value = game.balance;
+            betInput.value = balance;
         } else {
             const currentBet = parseInt(betInput.value) || 0;
             const newBet = currentBet + parseInt(val);
-            if (newBet <= game.balance) {
+            if (newBet <= balance) {
                 betInput.value = newBet;
             } else {
-                betInput.value = game.balance; // Cap at max balance
+                betInput.value = balance; // Cap at max balance
                 logMessage("Max bet reached!", "normal");
             }
         }
@@ -69,17 +80,18 @@ document.querySelectorAll('.chip-btn').forEach(btn => {
 });
 
 function updateUI() {
-    balanceDisplay.textContent = game.balance;
+    balanceDisplay.textContent = balance;
+    if (payoutInfoEl && payoutMultiplier) {
+        payoutInfoEl.textContent = `Win pays ${payoutMultiplier}x`;
+    }
 }
 
 function setDiceFace(element, value) {
     if (!element) return;
 
-    // Clear previous pips/text
     element.textContent = '';
     element.dataset.value = value;
 
-    // Create correct number of pips
     const dotCount = parseInt(value) || 0;
     for (let i = 0; i < dotCount; i++) {
         const pip = document.createElement('div');
@@ -90,7 +102,7 @@ function setDiceFace(element, value) {
 
 function logMessage(msg, type) {
     messageLog.textContent = msg;
-    if (type === 'error') messageLog.style.color = 'var(--color-ink-red)'; // dark red for parchment
+    if (type === 'error') messageLog.style.color = 'var(--color-ink-red)';
     else if (type === 'success') messageLog.style.color = 'var(--color-success)';
     else messageLog.style.color = 'var(--color-ink)';
 }
@@ -110,69 +122,61 @@ function setControlsEnabled(enabled) {
 async function runGameRound() {
     if (gameState !== 'BETTING') return; // Guard clause against double-firing
 
-    // 1. Validate Bet
-    const bet = parseInt(betInput.value);
-
-    // Auto-fix bet if invalid
-    let validBet = bet;
-    if (isNaN(bet) || bet <= 0) validBet = 10;
-    if (bet > game.balance) validBet = game.balance; // All in if bet exceeds balance
-
-    if (game.balance <= 0) {
-        logMessage("Ye be bankrupt! Resetting balance...", "error");
-        game.balance = 1000;
-        updateUI();
+    if (balance <= 0) {
+        logMessage("Ye be bankrupt! Requesting a demo refill...", "error");
+        try {
+            const data = await api('/api/demo-refill', { method: 'POST' });
+            balance = data.balance;
+            updateUI();
+        } catch (e) {
+            logMessage(e.message, "error");
+        }
         return;
     }
 
-    betInput.value = validBet;
+    const requestedBet = parseInt(betInput.value);
+    if (isNaN(requestedBet) || requestedBet <= 0) {
+        logMessage("Enter a valid wager before the bell tolls!", "error");
+        return;
+    }
 
-    // 2. Start Rolling Phase
     gameState = 'ROLLING';
     setControlsEnabled(false);
     logMessage("Rolling the bones...", "normal");
     gameResultBadge.classList.add('hidden');
 
+    const allDice = [...playerDiceEls, ...opponentDiceEls];
+    allDice.forEach(el => el.classList.add('rolling'));
+
     try {
-        game.placeBet(validBet);
-        updateUI();
+        // Fire the authoritative request and hold the animation for at least
+        // ANIMATION_DURATION_MS, whichever takes longer, so a fast server
+        // response doesn't cut the roll animation short.
+        const [data] = await Promise.all([
+            api('/api/bet', { method: 'POST', body: { amount: requestedBet } }),
+            new Promise(r => setTimeout(r, ANIMATION_DURATION_MS)),
+        ]);
 
-        // Animation
-        const allDice = [...playerDiceEls, ...actualOpponentDiceEls];
-        allDice.forEach(el => el.classList.add('rolling'));
-
-        await new Promise(r => setTimeout(r, ANIMATION_DURATION_MS));
-
-        // Logic
-        const rollResult = game.rollAll();
         allDice.forEach(el => el.classList.remove('rolling'));
 
-        // Update Faces
-        setDiceFace(playerDiceEls[0], rollResult.player[0]);
-        setDiceFace(playerDiceEls[1], rollResult.player[1]);
-        setDiceFace(actualOpponentDiceEls[0], rollResult.opponent[0]);
-        setDiceFace(actualOpponentDiceEls[1], rollResult.opponent[1]);
+        setDiceFace(playerDiceEls[0], data.playerRolls[0]);
+        setDiceFace(playerDiceEls[1], data.playerRolls[1]);
+        setDiceFace(opponentDiceEls[0], data.opponentRolls[0]);
+        setDiceFace(opponentDiceEls[1], data.opponentRolls[1]);
 
-        // Scoring
-        const pScore = game.getScore(rollResult.player);
-        const oScore = game.getScore(rollResult.opponent);
+        playerScoreEl.textContent = data.playerScore;
+        opponentScoreEl.textContent = data.opponentScore;
 
-        playerScoreEl.textContent = pScore;
-        opponentScoreEl.textContent = oScore;
-
-        const winner = game.determineWinner(pScore, oScore);
-        const winnings = game.resolveRound(validBet, winner);
-
+        balance = data.balance;
         updateUI();
 
-        // Result Messaging
         gameState = 'RESULT';
-        if (winner === 'player') {
-            logMessage(`You won ${winnings} doubloons!`, "success");
+        if (data.winner === 'player') {
+            logMessage(`You won ${data.winnings} doubloons!`, "success");
             gameResultBadge.textContent = "WINNER!";
             gameResultBadge.style.color = "var(--color-success)";
             gameResultBadge.classList.remove('hidden');
-        } else if (winner === 'opponent') {
+        } else if (data.winner === 'opponent') {
             logMessage("The house wins this time...", "error");
             gameResultBadge.textContent = "DEFEAT";
             gameResultBadge.style.color = "var(--color-ink-red)";
@@ -183,18 +187,14 @@ async function runGameRound() {
             gameResultBadge.style.color = "var(--color-ink)";
             gameResultBadge.classList.remove('hidden');
         }
-
     } catch (e) {
+        allDice.forEach(el => el.classList.remove('rolling'));
         logMessage(e.message, "error");
     }
 
-    // Wait for result display
     await new Promise(r => setTimeout(r, RESULT_DISPLAY_DURATION_MS));
 
-    // Choose new opponent for next round
     pickNewOpponent();
-
-    // Reset for next round
     startBettingPhase();
 }
 
@@ -202,7 +202,6 @@ function pickNewOpponent() {
     const idx = Math.floor(Math.random() * OPPONENTS.length);
     currentOpponent = OPPONENTS[idx];
 
-    // Update UI
     if (opponentAvatarEl) opponentAvatarEl.src = currentOpponent.avatar;
     if (opponentNameEl) opponentNameEl.textContent = currentOpponent.name;
 
@@ -216,9 +215,6 @@ function startBettingPhase() {
 
     timeRemaining = ROUND_DURATION_MS;
     lastTime = Date.now();
-
-    // Reset Dice (optional visual reset)
-    // could set them to '?'
 }
 
 function gameLoop() {
@@ -234,7 +230,6 @@ function gameLoop() {
             runGameRound();
         }
 
-        // Update Timer UI
         const pct = (timeRemaining / ROUND_DURATION_MS) * 100;
         timerBar.style.width = `${pct}%`;
         timerText.textContent = `${Math.ceil(timeRemaining / 1000)}s`;
@@ -243,13 +238,23 @@ function gameLoop() {
     requestAnimationFrame(gameLoop);
 }
 
-// Init
-let lastTime = Date.now();
-startBettingPhase();
-gameLoop();
+async function init() {
+    setDiceFace(playerDiceEls[0], 1);
+    setDiceFace(playerDiceEls[1], 1);
+    setDiceFace(opponentDiceEls[0], 1);
+    setDiceFace(opponentDiceEls[1], 1);
 
-updateUI();
-setDiceFace(playerDiceEls[0], 1);
-setDiceFace(playerDiceEls[1], 1);
-setDiceFace(actualOpponentDiceEls[0], 1);
-setDiceFace(actualOpponentDiceEls[1], 1);
+    try {
+        const data = await api('/api/state');
+        balance = data.balance;
+        payoutMultiplier = data.payoutMultiplier;
+    } catch (e) {
+        logMessage("Could not reach the captain's ledger. Refresh to try again.", "error");
+    }
+
+    updateUI();
+    startBettingPhase();
+    gameLoop();
+}
+
+init();

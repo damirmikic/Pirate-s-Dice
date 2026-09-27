@@ -1,0 +1,14 @@
+{
+  "name": "pirates-dice-duel",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Pirate's Dice Duel — server-authoritative dice duel game.",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

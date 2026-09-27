@@ -491,6 +491,14 @@ h1 {
     transform: scale(0.95);
 }
 
+.payout-info {
+    font-family: var(--font-body);
+    font-size: 0.85rem;
+    color: var(--color-gold);
+    opacity: 0.8;
+    text-align: center;
+}
+
 /* Timer */
 .timer-container {
     width: 100%;
